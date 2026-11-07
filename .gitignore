@@ -1,0 +1,7 @@
+node_modules/
+
+# Sniffer captures and network keys never go into git
+captures-private/
+*.pcap
+KEYS*
+__pycache__/

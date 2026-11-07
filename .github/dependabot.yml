@@ -1,0 +1,33 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - automated
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - automated
+    # The pins are the versions the running zigbee2mqtt ships (2.14.3); they move when zigbee2mqtt does.
+    # New releases are tested every run by the "latest" CI job instead.
+    ignore:
+      - dependency-name: zigbee-herdsman
+      - dependency-name: zigbee-herdsman-converters
+
+  - package-ecosystem: pip
+    directory: /tools
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - automated

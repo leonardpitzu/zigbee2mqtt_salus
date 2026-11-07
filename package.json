@@ -1,0 +1,14 @@
+{
+  "name": "zigbee2mqtt_salus",
+  "private": true,
+  "type": "module",
+  "description": "zigbee2mqtt external converters for Salus iT600 thermostats (SQ610RF, SQ610RFNH) and the KL08RF wiring centre",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test tests/"
+  },
+  "devDependencies": {
+    "zigbee-herdsman": "11.2.0",
+    "zigbee-herdsman-converters": "26.125.0"
+  }
+}

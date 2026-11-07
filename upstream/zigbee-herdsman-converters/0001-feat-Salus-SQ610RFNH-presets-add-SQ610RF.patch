@@ -1,0 +1,408 @@
+From d13ecc6d05730c7a1f658b3e0b31ef6edc9df3af Mon Sep 17 00:00:00 2001
+From: leonardpitzu <leonard.pitzu@gmail.com>
+Date: Fri, 6 Nov 2026 16:57:15 +0200
+Subject: [PATCH] feat: Salus SQ610RFNH presets, add SQ610RF
+
+Turning an iT600 thermostat on always set permanent hold (manual), which
+switches off the program set on the thermostat. Expose the hold type as a
+preset (schedule, manual, away) and as a hold_type diagnostic, turn on in
+the preset the thermostat had before it was turned off, and write nothing
+when it is already on. Mode writes wait for the thermostat's echo and run
+one after the other per thermostat.
+
+The SQ610RF uses the same protocol and is added as a white label.
+---
+ src/devices/salus_controls.ts | 177 +++++++++++++++++++++++++++++++---
+ test/salus_controls.test.ts   | 131 +++++++++++++++++++++++++
+ 2 files changed, 294 insertions(+), 14 deletions(-)
+ create mode 100644 test/salus_controls.test.ts
+
+diff --git a/src/devices/salus_controls.ts b/src/devices/salus_controls.ts
+index 3f9f049..0831e04 100644
+--- a/src/devices/salus_controls.ts
++++ b/src/devices/salus_controls.ts
+@@ -40,7 +40,44 @@ interface Salus {
+ interface SalusIt600 {
+     attributes: never;
+     commands: {syncRequest: {payload: Buffer}};
+-    commandResponses: {syncRequest: {payload: Buffer}; record: {payload: Buffer}; write: {payload: Buffer}; syncResponse: {payload: Buffer}};
++    commandResponses: {
++        syncRequest: {payload: Buffer};
++        record: {payload: Buffer};
++        write: {payload: Buffer};
++        echo: {payload: Buffer};
++        syncResponse: {payload: Buffer};
++    };
++}
++
++// Hold types in the iT600 status record. A temporary hold is a setpoint changed while the schedule runs, until its next step.
++const it600HoldTypes: Record<number, string> = {0: "schedule", 1: "temporary_hold", 2: "manual", 6: "away", 7: "standby"};
++const it600Presets: Record<string, number> = {schedule: 0, manual: 2, away: 6};
++
++// What was last learned of a thermostat from its status records and from finished writes. seq counts the updates, so a
++// command that had to wait for an earlier one can tell that the state Zigbee2MQTT passed it is out of date.
++interface It600Learned {
++    seq: number;
++    systemMode?: string;
++    preset?: string;
++}
++
++function it600Learned(device: Zh.Device): It600Learned {
++    return globalStore.getValue(device, "it600Learned", {seq: 0});
++}
++
++function it600Learn(device: Zh.Device, update: {systemMode?: string; preset?: string}) {
++    const learned = it600Learned(device);
++    globalStore.putValue(device, "it600Learned", {
++        seq: learned.seq + 1,
++        systemMode: update.systemMode ?? learned.systemMode,
++        preset: update.preset ?? learned.preset,
++    });
++}
++
++function it600State(device: Zh.Device, state: KeyValueAny, seqOnArrival: number): KeyValueAny {
++    const learned = it600Learned(device);
++    if (learned.seq === seqOnArrival) return state;
++    return {...state, system_mode: learned.systemMode ?? state.system_mode, preset: learned.preset ?? state.preset};
+ }
+ 
+ const fzLocal = {
+@@ -86,14 +123,33 @@ const fzLocal = {
+             if (battery !== undefined) result.battery = battery;
+             // 12.34 is a placeholder the thermostat regularly sends instead of a reading
+             if (record.readUInt16BE(4) !== 0x1234) result.local_temperature = bcd(4) / 100;
++            const holdType = it600HoldTypes[record[3]];
++            if (holdType !== undefined) {
++                result.hold_type = holdType;
++                // No preset while off, so the one to go back to is kept
++                if (holdType !== "standby") result.preset = holdType === "temporary_hold" ? "schedule" : holdType;
++            }
++            it600Learn(msg.device, {systemMode: result.system_mode, preset: result.preset});
+             return result;
+         },
+     } satisfies Fz.Converter<"manuSpecificSalusIt600", SalusIt600, "commandRecord">,
++    it600_echo: {
++        cluster: "manuSpecificSalusIt600",
++        type: "commandEcho",
++        convert: (model, msg, publish, options, meta) => {
++            const echo = msg.data.payload;
++            const pending = it600Echoes.get(`${msg.device.ieeeAddr}/${echo[0]}`);
++            if (pending?.command === echo.subarray(1, 4).toString()) pending.resolve();
++        },
++    } satisfies Fz.Converter<"manuSpecificSalusIt600", SalusIt600, "commandEcho">,
+ };
+ 
+ // iT600 protocol: https://github.com/mikkelke/salus-zigbee/blob/main/PROTOCOL.md
+ const it600Payload = [{name: "payload", type: Zcl.BuffaloZclDataType.BUFFER}];
+ let it600Handle = 0;
++// Writes waiting for the thermostat's echo, by `<ieeeAddr>/<handle>`
++const it600Echoes = new Map<string, {command: string; resolve: () => void}>();
++const it600Queues = new Map<string, Promise<unknown>>();
+ 
+ const salusExtend = {
+     addGatewayBasic: () =>
+@@ -119,6 +175,8 @@ const salusExtend = {
+                 syncRequest: {name: "syncRequest", ID: 0x10, parameters: it600Payload},
+                 record: {name: "record", ID: 0x31, parameters: it600Payload},
+                 write: {name: "write", ID: 0x32, parameters: it600Payload},
++                // The thermostat answers each write with its handle and command
++                echo: {name: "echo", ID: 0x33, parameters: it600Payload},
+                 syncResponse: {name: "syncResponse", ID: 0x81, parameters: it600Payload},
+             },
+         }),
+@@ -157,25 +215,100 @@ const salusExtend = {
+     },
+ };
+ 
+-async function it600Write(endpoint: Zh.Endpoint, command: string, ...args: number[]) {
++function it600NextHandle() {
+     // Handles 1-127, the device uses the others for its own reports
+     it600Handle = (it600Handle % 0x7f) + 1;
+-    const payload = Buffer.from([it600Handle, ...Buffer.from(command), ...args]);
++    return it600Handle;
++}
++
++async function it600Send(endpoint: Zh.Endpoint, handle: number, command: string, args: number[]) {
++    const payload = Buffer.from([handle, ...Buffer.from(command), ...args]);
+     await endpoint.commandResponse<"manuSpecificSalusIt600", "write", SalusIt600>("manuSpecificSalusIt600", "write", {payload});
+ }
+ 
++async function it600Write(endpoint: Zh.Endpoint, command: string, ...args: number[]) {
++    await it600Send(endpoint, it600NextHandle(), command, args);
++}
++
++// Mode changes take several writes, each sent once the thermostat echoed the one before
++async function it600WriteConfirmed(endpoint: Zh.Endpoint, command: string, ...args: number[]) {
++    const handle = it600NextHandle();
++    const key = `${endpoint.deviceIeeeAddress}/${handle}`;
++    const echoed = new Promise<void>((resolve) => it600Echoes.set(key, {command, resolve}));
++    let timer: NodeJS.Timeout | undefined;
++    try {
++        await it600Send(endpoint, handle, command, args);
++        const timeout = new Promise<never>((_resolve, reject) => {
++            timer = setTimeout(() => reject(new Error(`No ${command} echo from '${endpoint.deviceIeeeAddress}'`)), 30000);
++        });
++        await Promise.race([echoed, timeout]);
++    } finally {
++        clearTimeout(timer);
++        it600Echoes.delete(key);
++    }
++}
++
++// Commands to one thermostat run one after the other
++function it600Queue<T>(device: Zh.Device, task: () => Promise<T>): Promise<T> {
++    const run = (it600Queues.get(device.ieeeAddr) ?? Promise.resolve()).then(task, task);
++    it600Queues.set(
++        device.ieeeAddr,
++        run.catch(() => {}),
++    );
++    return run;
++}
++
++// On is manual and the system mode, as the Salus gateway sends it. Schedule or away is written after that.
++async function it600TurnOn(endpoint: Zh.Endpoint, systemMode: string, preset: string) {
++    await it600WriteConfirmed(endpoint, "B20", it600Presets.manual);
++    await it600WriteConfirmed(endpoint, "B48", systemMode === "cool" ? 3 : 4);
++    if (preset !== "manual") await it600WriteConfirmed(endpoint, "B20", it600Presets[preset]);
++    it600Learn(endpoint.getDevice(), {systemMode, preset});
++}
++
+ const tzLocal = {
+     it600_system_mode: {
+         key: ["system_mode"],
+         convertSet: async (entity, key, value, meta) => {
+             utils.assertEndpoint(entity);
+-            if (value === "off") {
+-                await it600Write(entity, "B20", 7); // Standby
+-            } else {
+-                await it600Write(entity, "B20", 2); // Permanent hold
+-                await it600Write(entity, "B48", value === "cool" ? 3 : 4);
+-            }
+-            return {state: {system_mode: value}};
++            utils.assertString(value, key);
++            utils.validateValue(value, ["off", "heat", "cool"]);
++            const device = entity.getDevice();
++            const seqOnArrival = it600Learned(device).seq;
++            return await it600Queue(device, async () => {
++                const state = it600State(device, meta.state, seqOnArrival);
++                if (value === "off") {
++                    await it600WriteConfirmed(entity, "B20", 7); // Standby
++                    it600Learn(device, {systemMode: "off"});
++                    return {state: {system_mode: "off", hold_type: "standby"}};
++                }
++                // Turning it on again would put it in manual and stop its schedule
++                if (state.system_mode === value) return {state: {system_mode: value}};
++                // Back to the preset it had before it was turned off
++                const preset = it600Presets[state.preset] === undefined ? "manual" : state.preset;
++                await it600TurnOn(entity, value, preset);
++                return {state: {system_mode: value, preset, hold_type: preset}};
++            });
++        },
++    } satisfies Tz.Converter,
++    it600_preset: {
++        key: ["preset"],
++        convertSet: async (entity, key, value, meta) => {
++            utils.assertEndpoint(entity);
++            utils.assertString(value, key);
++            utils.validateValue(value, Object.keys(it600Presets));
++            const device = entity.getDevice();
++            const seqOnArrival = it600Learned(device).seq;
++            return await it600Queue(device, async () => {
++                const state = it600State(device, meta.state, seqOnArrival);
++                if (state.system_mode !== "heat" && state.system_mode !== "cool") {
++                    await it600TurnOn(entity, "heat", value);
++                    return {state: {system_mode: "heat", preset: value, hold_type: value}};
++                }
++                await it600WriteConfirmed(entity, "B20", it600Presets[value]);
++                it600Learn(device, {preset: value});
++                return {state: {preset: value, hold_type: value}};
++            });
+         },
+     } satisfies Tz.Converter,
+     it600_setpoint: {
+@@ -394,25 +527,41 @@ export const definitions: DefinitionWithExtend[] = [
+         ota: {manufacturerName: "SalusControls"},
+     },
+     {
+-        zigbeeModel: ["SQ610RFNH"],
++        zigbeeModel: ["SQ610RFNH", "SQ610RF"],
+         model: "SQ610RFNH",
+         vendor: "Salus Controls",
+         description: "Quantum wireless thermostat",
++        whiteLabel: [{vendor: "Salus Controls", model: "SQ610RF", description: "Quantum wireless thermostat", fingerprint: [{modelID: "SQ610RF"}]}],
+         extend: [
+             salusExtend.addGatewayBasic(),
+             salusExtend.addIt600Cluster(),
+             salusExtend.it600Sync(0x20, 9),
+             m.forcePowerSource({powerSource: "Battery"}),
+         ],
+-        fromZigbee: [fzLocal.it600_status],
+-        toZigbee: [tzLocal.it600_system_mode, tzLocal.it600_setpoint, tzLocal.it600_child_lock, tzLocal.it600_wiring_centre_zones],
++        fromZigbee: [fzLocal.it600_status, fzLocal.it600_echo],
++        toZigbee: [
++            tzLocal.it600_system_mode,
++            tzLocal.it600_preset,
++            tzLocal.it600_setpoint,
++            tzLocal.it600_child_lock,
++            tzLocal.it600_wiring_centre_zones,
++        ],
+         exposes: [
+             e
+                 .climate()
+                 .withSetpoint("current_heating_setpoint", 5, 40, 0.5, ea.STATE_SET)
+                 .withLocalTemperature(ea.STATE)
+                 .withSystemMode(["off", "heat", "cool"], ea.STATE_SET)
+-                .withRunningState(["idle", "heat"], ea.STATE),
++                .withRunningState(["idle", "heat"], ea.STATE)
++                .withPreset(
++                    Object.keys(it600Presets),
++                    "schedule follows the program set on the thermostat, manual keeps the setpoint, away uses the away setpoint. " +
++                        "Turning the thermostat on goes back to the preset it had before it was turned off",
++                ),
++            e
++                .enum("hold_type", ea.STATE, Object.values(it600HoldTypes))
++                .withDescription("Hold type the thermostat reports, temporary_hold is a setpoint changed while the schedule runs")
++                .withCategory("diagnostic"),
+             e.humidity(),
+             e.battery(),
+             e.child_lock(),
+diff --git a/test/salus_controls.test.ts b/test/salus_controls.test.ts
+new file mode 100644
+index 0000000..0623593
+--- /dev/null
++++ b/test/salus_controls.test.ts
+@@ -0,0 +1,131 @@
++import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
++import {Zcl} from "zigbee-herdsman";
++import {findByDevice} from "../src/index";
++import * as globalStore from "../src/lib/store";
++import type {Definition, Fz, KeyValueAny, Tz, Zh} from "../src/lib/types";
++import {mockDevice} from "./utils";
++
++const CLUSTER = "manuSpecificSalusIt600";
++
++// iT600 status record (0x71) with a hold type, 21.50 °C measured, 20.50 °C setpoint
++function statusRecord(holdType: number) {
++    const record = Buffer.alloc(50);
++    record[0] = 0x71;
++    record[3] = holdType;
++    record.writeUInt16BE(0x2150, 4);
++    record.writeUInt16BE(0x2050, 9);
++    record[15] = 4;
++    return record;
++}
++
++describe("Salus SQ610RFNH", () => {
++    let device: Zh.Device;
++    let endpoint: Zh.Endpoint;
++    let definition: Definition;
++    let written: string[];
++    let echo: boolean;
++
++    const receive = (type: string, payload: Buffer) => {
++        let result: KeyValueAny = {};
++        for (const converter of definition.fromZigbee.filter((c) => c.cluster === CLUSTER && c.type === type)) {
++            const msg = {data: {payload}, device, endpoint, type, cluster: CLUSTER} as unknown as Fz.Message;
++            result = {...result, ...converter.convert(definition, msg, () => {}, {}, {} as Fz.Meta)};
++        }
++        return result;
++    };
++
++    const set = (key: string, value: string, state: KeyValueAny) => {
++        const converter = definition.toZigbee.find((c) => c.key.includes(key));
++        const meta = {state, message: {[key]: value}, device, mapped: definition, options: {}, endpoint_name: undefined} as unknown as Tz.Meta;
++        return converter.convertSet(endpoint, key, value, meta);
++    };
++
++    beforeEach(async () => {
++        globalStore.clear();
++        device = mockDevice({modelID: "SQ610RFNH", manufacturerName: "SALUS", endpoints: [{ID: 9}]}, "EndDevice");
++        endpoint = device.getEndpoint(9);
++        definition = await findByDevice(device);
++        written = [];
++        echo = true;
++        vi.spyOn(endpoint, "commandResponse").mockImplementation((clusterKey, command, payload) => {
++            const write = (payload as {payload: Buffer}).payload;
++            written.push(`${write.subarray(1, 4).toString()} ${write.subarray(4).toString("hex")}`);
++            if (echo) setImmediate(() => receive("commandEcho", write));
++            return Promise.resolve();
++        });
++    });
++
++    afterEach(() => {
++        vi.useRealTimers();
++    });
++
++    it("matches the SQ610RF as a white label", async () => {
++        const rf = mockDevice({modelID: "SQ610RF", manufacturerName: "SALUS", endpoints: [{ID: 9}]}, "EndDevice");
++        expect((await findByDevice(rf)).model).toBe("SQ610RF");
++        expect(definition.model).toBe("SQ610RFNH");
++    });
++
++    it("parses the thermostat's echo of a write", async () => {
++        await definition.configure?.(device, endpoint, definition);
++        const frame = Buffer.from([0x1d, 0x78, 0x10, 0x01, 0x33, 0x05, ...Buffer.from("B20"), 0x02]);
++        const parsed = Zcl.Frame.fromBuffer(0xfc00, Zcl.Header.fromBuffer(frame), frame, device.customClusters);
++        expect(parsed.command.name).toBe("echo");
++        expect(parsed.payload).toStrictEqual({payload: Buffer.from([0x05, ...Buffer.from("B20"), 0x02])});
++    });
++
++    it("reports hold type and preset, and keeps the preset while off", () => {
++        expect(receive("commandRecord", statusRecord(0))).toMatchObject({hold_type: "schedule", preset: "schedule", system_mode: "heat"});
++        expect(receive("commandRecord", statusRecord(1))).toMatchObject({hold_type: "temporary_hold", preset: "schedule"});
++        expect(receive("commandRecord", statusRecord(2))).toMatchObject({hold_type: "manual", preset: "manual"});
++        expect(receive("commandRecord", statusRecord(6))).toMatchObject({hold_type: "away", preset: "away"});
++        const off = receive("commandRecord", statusRecord(7));
++        expect(off).toMatchObject({hold_type: "standby", system_mode: "off"});
++        expect(off.preset).toBeUndefined();
++    });
++
++    it("turns off to standby", async () => {
++        expect(await set("system_mode", "off", {system_mode: "heat", preset: "schedule"})).toStrictEqual({
++            state: {system_mode: "off", hold_type: "standby"},
++        });
++        expect(written).toStrictEqual(["B20 07"]);
++    });
++
++    it.each([
++        ["schedule", ["B20 02", "B48 04", "B20 00"]],
++        ["manual", ["B20 02", "B48 04"]],
++        ["away", ["B20 02", "B48 04", "B20 06"]],
++    ])("turns on in the preset it had before it was turned off (%s)", async (preset, writes) => {
++        expect(await set("system_mode", "heat", {system_mode: "off", preset})).toStrictEqual({
++            state: {system_mode: "heat", preset, hold_type: preset},
++        });
++        expect(written).toStrictEqual(writes);
++    });
++
++    it("writes nothing when turned on while on, so a running schedule is kept", async () => {
++        expect(await set("system_mode", "heat", {system_mode: "heat", preset: "schedule"})).toStrictEqual({state: {system_mode: "heat"}});
++        expect(written).toStrictEqual([]);
++    });
++
++    it("does not skip an on that waited for an off", async () => {
++        // Both arrive before the off is done, so both get the state from before it
++        const state = {system_mode: "heat", preset: "schedule"};
++        await Promise.all([set("system_mode", "off", state), set("system_mode", "heat", state)]);
++        expect(written).toStrictEqual(["B20 07", "B20 02", "B48 04", "B20 00"]);
++    });
++
++    it("sets a preset, turning the thermostat on when it is off", async () => {
++        await set("preset", "away", {system_mode: "heat", preset: "schedule"});
++        expect(written).toStrictEqual(["B20 06"]);
++        written = [];
++        await set("preset", "schedule", {system_mode: "off", preset: "manual"});
++        expect(written).toStrictEqual(["B20 02", "B48 04", "B20 00"]);
++    });
++
++    it("fails when the thermostat does not echo a write", async () => {
++        vi.useFakeTimers({toFake: ["setTimeout"]});
++        echo = false;
++        const result = expect(set("system_mode", "off", {system_mode: "heat"})).rejects.toThrow("No B20 echo");
++        await vi.advanceTimersByTimeAsync(30000);
++        await result;
++    });
++});
+-- 
+2.54.0 (Apple Git-157)
+
